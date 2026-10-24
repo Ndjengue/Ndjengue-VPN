@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// Regras de referência para o Firestore (ver README — "Pontos a reforçar
+// antes de produção"). Aplicar isto no Firebase Console > Firestore >
+// Regras antes de usar o app com dados reais: sem isto, qualquer pessoa
+// autenticada consegue ler/escrever os dados de qualquer família.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Só o próprio pai (donoUid) lê/escreve a sua família e tudo o que está
+    // dentro dela. O dispositivo da criança autentica-se de forma anónima
+    // (Firebase Anonymous Auth) e só pode aceder ao SEU PRÓPRIO documento de
+    // dispositivo e ao que está dentro dele, nunca à família nem aos outros
+    // dispositivos — identificado pelo campo uidAutenticacao gravado no
+    // emparelhamento (ver TelaEmparelhamento.kt).
+    match /familias/{familiaId} {
+      allow read, write: if request.auth != null
+                          && resource.data.donoUid == request.auth.uid;
+
+      allow create: if request.auth != null
+                     && request.resource.data.donoUid == request.auth.uid;
+
+      function ehOPai() {
+        return request.auth != null
+               && get(/databases/$(database)/documents/familias/$(familiaId)).data.donoUid == request.auth.uid;
+      }
+
+      match /dispositivos/{dispositivoId} {
+        function ehOProprioDispositivo() {
+          return request.auth != null
+                 && resource.data.uidAutenticacao == request.auth.uid;
+        }
+
+        allow read, update: if ehOPai() || ehOProprioDispositivo();
+        // Só o pai apaga um dispositivo; a criação inicial exige que o
+        // uidAutenticacao enviado corresponda a quem está a escrever (o
+        // próprio dispositivo, autenticado anonimamente, no emparelhamento).
+        allow create: if request.auth != null
+                       && request.resource.data.uidAutenticacao == request.auth.uid;
+        allow delete: if ehOPai();
+
+        match /{subcolecao}/{documento=**} {
+          allow read, write: if ehOPai()
+                              || (request.auth != null
+                                  && get(/databases/$(database)/documents/familias/$(familiaId)/dispositivos/$(dispositivoId)).data.uidAutenticacao == request.auth.uid);
+        }
+      }
+    }
+
+    // Emparelhamento: qualquer dispositivo pode LER o seu próprio código
+    // (para o validar) mas não listar todos; a escrita (criação do código)
+    // só pelo pai autenticado dono da família referida.
+    match /emparelhamentos/{codigo} {
+      allow get: if true; // a leitura de um código específico exige sabê-lo
+      allow list: if false;
+      allow create: if request.auth != null
+                     && get(/databases/$(database)/documents/familias/$(request.resource.data.familiaId)).data.donoUid == request.auth.uid;
+      allow delete: if request.auth != null; // o dispositivo filho (autenticado anonimamente) apaga o código depois de o consumir
+    }
+  }
+}

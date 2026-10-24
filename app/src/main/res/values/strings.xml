@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Controlo Parental</string>
+    <string name="descricao_servico_acessibilidade">Permite detetar qual app está em primeiro plano, para aplicar as regras de bloqueio definidas pelos pais.</string>
+    <string name="titulo_bloqueio">Este conteúdo está bloqueado pelos pais</string>
+    <string name="botao_pedir_liberacao">Pedir liberação</string>
+</resources>

@@ -7,6 +7,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+        tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Listagem e controlo de apps -->
@@ -34,7 +37,8 @@
         <activity
             android:name=".comum.MainActivity"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.ControloParental.Arranque">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -49,17 +53,10 @@
             android:launchMode="singleInstance"
             android:theme="@style/Theme.ControloParental.Bloqueio" />
 
-        <!-- Pedido de senha antes de desativar o Device Admin -->
-        <activity
-            android:name=".filho.SenhaAdminActivity"
-            android:exported="false"
-            android:theme="@style/Theme.ControloParental" />
-
         <!-- Filtro de rede (VpnService) -->
         <service
             android:name=".vpn.FiltroVpnService"
             android:exported="false"
-            android:foregroundServiceType="specialUse"
             android:permission="android.permission.BIND_VPN_SERVICE">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
@@ -96,13 +93,29 @@
         <service
             android:name=".servico.ServicoSincronizacao"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="location|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Mantém as regras dos pais, o sinal de vida e a localização da criança sincronizados" />
+        </service>
+
+        <!-- Monitor de pedidos e alertas no telemóvel dos pais -->
+        <service
+            android:name=".servico.ServicoMonitorPai"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Notificações locais de pedidos de liberação e alertas da família" />
+        </service>
 
         <receiver
             android:name=".servico.BootReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 

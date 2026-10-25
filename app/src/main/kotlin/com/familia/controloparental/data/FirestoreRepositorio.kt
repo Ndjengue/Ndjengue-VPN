@@ -1,308 +1,657 @@
 package com.familia.controloparental.data
 
 import com.familia.controloparental.comum.*
+import com.google.firebase.firestore.CollectionReference
+import com.google.firebase.firestore.DocumentReference
+import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FieldPath
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.QuerySnapshot
+import com.google.firebase.firestore.SetOptions
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
-import java.security.MessageDigest
-import kotlin.random.Random
 
 /**
- * Camada de acesso ao Firestore. Único ponto de leitura/escrita remota;
- * tanto o modo Pai como o modo Filho passam por aqui.
+ * Único ponto de acesso ao Firestore (plano gratuito Spark: sem Functions, sem Storage).
  *
- * Estrutura (ver secção 12 do documento de requisitos):
- *   familias/{familiaId}
- *   familias/{familiaId}/dispositivos/{dispositivoId}
- *   familias/{familiaId}/dispositivos/{dispositivoId}/apps/{nomePacote}
- *   familias/{familiaId}/dispositivos/{dispositivoId}/regrasUrl/{regraId}
- *   familias/{familiaId}/dispositivos/{dispositivoId}/perfisHorario/{perfilId}
- *   familias/{familiaId}/dispositivos/{dispositivoId}/pedidosLiberacao/{pedidoId}
- *   familias/{familiaId}/dispositivos/{dispositivoId}/relatorios/{data}
- *   emparelhamentos/{codigo}
+ * Estrutura:
+ *   familias/{fid}                           donoUid, emailRecuperacao
+ *   familias/{fid}/membros/{uid}             papel = "pai" | "filho"
+ *   familias/{fid}/segredo/admin             hash, sal (PIN de administrador)
+ *   familias/{fid}/dispositivos/{did}        perfil da criança, heartbeat, localização, proteções
+ *     .../apps/{pacote}  .../regrasUrl/{id}  .../perfisHorario/{id}
+ *     .../relatorios/{AAAA-MM-DD}  .../bloqueios/{auto}  .../localizacoes/{auto}
+ *   familias/{fid}/pedidos/{id}              pedidos de liberação
+ *   familias/{fid}/alertas/{id}              alertas para os pais
+ *   convites/{codigo}                        código de emparelhamento (6 dígitos)
  */
 class FirestoreRepositorio(
     private val db: FirebaseFirestore = FirebaseFirestore.getInstance()
 ) {
-    private fun dispositivoRef(familiaId: String, dispositivoId: String) =
-        db.collection("familias").document(familiaId)
-            .collection("dispositivos").document(dispositivoId)
 
-    // ---------- Família ----------
+    // ---------- Referências ----------
 
-    suspend fun criarFamilia(donoUid: String, emailRecuperacao: String, senhaAdmin: String): String {
-        val familiaId = db.collection("familias").document().id
-        val familia = mapOf(
-            "donoUid" to donoUid,
-            "emailRecuperacao" to emailRecuperacao,
-            "senhaAdminHash" to hashSenha(senhaAdmin)
+    private fun familiaRef(fid: String) = db.collection("familias").document(fid)
+    private fun dispositivoRef(fid: String, did: String) =
+        familiaRef(fid).collection("dispositivos").document(did)
+
+    // ---------- Fluxos ----------
+
+    private fun <T> Query.fluxo(mapear: (QuerySnapshot) -> T): Flow<T> = callbackFlow {
+        val registo = addSnapshotListener { snap, _ ->
+            if (snap != null) trySend(mapear(snap))
+        }
+        awaitClose { registo.remove() }
+    }
+
+    private fun <T> DocumentReference.fluxoDoc(mapear: (DocumentSnapshot) -> T): Flow<T> = callbackFlow {
+        val registo = addSnapshotListener { snap, _ ->
+            if (snap != null) trySend(mapear(snap))
+        }
+        awaitClose { registo.remove() }
+    }
+
+    // ---------- Família e PIN de administrador ----------
+
+    suspend fun criarFamilia(donoUid: String, emailRecuperacao: String, pin: String): String {
+        val fid = db.collection("familias").document().id
+        val sal = Seguranca.gerarSal()
+        val hash = Seguranca.calcularHash(pin, sal)
+        val lote = db.batch()
+        lote.set(
+            familiaRef(fid),
+            mapOf("donoUid" to donoUid, "emailRecuperacao" to emailRecuperacao, "criadoEm" to System.currentTimeMillis())
         )
-        db.collection("familias").document(familiaId).set(familia).await()
-        return familiaId
+        lote.set(familiaRef(fid).collection("membros").document(donoUid), mapOf("papel" to "pai"))
+        lote.set(
+            familiaRef(fid).collection("segredo").document("admin"),
+            mapOf("hash" to hash, "sal" to sal, "atualizadoEm" to System.currentTimeMillis())
+        )
+        lote.commit().await()
+        return fid
     }
 
-    /** Uma conta de pai gere uma única família (ver secção 11: dispositivos ilimitados DENTRO dela). */
-    suspend fun buscarFamiliaPorDono(donoUid: String): String? {
-        val resultado = db.collection("familias")
-            .whereEqualTo("donoUid", donoUid)
-            .limit(1)
-            .get()
-            .await()
-        return resultado.documents.firstOrNull()?.id
+    suspend fun buscarFamiliaDoPai(donoUid: String): String? {
+        val r = db.collection("familias").whereEqualTo("donoUid", donoUid).limit(1).get().await()
+        return r.documents.firstOrNull()?.id
     }
 
-    fun hashSenha(senha: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(senha.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
+    suspend fun alterarPinAdmin(fid: String, novoPin: String) {
+        val sal = Seguranca.gerarSal()
+        val hash = Seguranca.calcularHash(novoPin, sal)
+        familiaRef(fid).collection("segredo").document("admin")
+            .set(mapOf("hash" to hash, "sal" to sal, "atualizadoEm" to System.currentTimeMillis())).await()
+    }
+
+    /** Devolve (hash, sal) do PIN de administrador. */
+    suspend fun obterSegredoAdmin(fid: String): Pair<String, String>? {
+        val d = familiaRef(fid).collection("segredo").document("admin").get().await()
+        val hash = d.getString("hash") ?: return null
+        val sal = d.getString("sal") ?: return null
+        return hash to sal
+    }
+
+    fun observarSegredoAdmin(fid: String): Flow<Pair<String, String>?> =
+        familiaRef(fid).collection("segredo").document("admin").fluxoDoc { d ->
+            val h = d.getString("hash")
+            val s = d.getString("sal")
+            if (h != null && s != null) h to s else null
+        }
+
+    /** Valida o PIN contra o servidor (usado pelo pai ao confirmar ações sensíveis). */
+    suspend fun verificarPinAdmin(fid: String, pin: String): Boolean {
+        val segredo = obterSegredoAdmin(fid) ?: return false
+        return Seguranca.verificar(pin, segredo.second, segredo.first)
     }
 
     // ---------- Emparelhamento ----------
 
-    suspend fun gerarCodigoEmparelhamento(familiaId: String): String {
-        val codigo = (100000..999999).random().toString()
-        val agora = System.currentTimeMillis()
-        val emparelhamento = mapOf(
-            "familiaId" to familiaId,
-            "criadoEm" to agora,
-            "expiraEm" to agora + 5 * 60 * 1000L // 5 minutos
-        )
-        db.collection("emparelhamentos").document(codigo).set(emparelhamento).await()
-        return codigo
-    }
-
-    /** Devolve o familiaId se o código for válido e não tiver expirado; apaga-o em seguida. */
-    suspend fun resolverEmparelhamento(codigo: String): String? {
-        val doc = db.collection("emparelhamentos").document(codigo).get().await()
-        if (!doc.exists()) return null
-        val expiraEm = doc.getLong("expiraEm") ?: 0L
-        if (System.currentTimeMillis() > expiraEm) {
-            db.collection("emparelhamentos").document(codigo).delete()
-            return null
-        }
-        val familiaId = doc.getString("familiaId")
-        db.collection("emparelhamentos").document(codigo).delete()
-        return familiaId
-    }
-
-    suspend fun registarDispositivo(familiaId: String, dispositivoId: String, nome: String, uidAutenticacao: String) {
-        dispositivoRef(familiaId, dispositivoId).set(
+    /** O pai cria primeiro o dispositivo "pendente" com o perfil da criança. */
+    suspend fun criarDispositivoPendente(fid: String, perfil: PerfilCrianca): String {
+        val ref = familiaRef(fid).collection("dispositivos").document()
+        ref.set(
             mapOf(
-                "nome" to nome,
-                "online" to true,
-                "ultimaSincronizacao" to System.currentTimeMillis(),
-                "uidAutenticacao" to uidAutenticacao
+                "nome" to "",
+                "emparelhado" to false,
+                "onlineDeclarado" to false,
+                "criadoEm" to System.currentTimeMillis(),
+                "crianca" to mapaDePerfil(perfil)
             )
         ).await()
-    }
-
-    // ---------- Dispositivos (painel do pai) ----------
-
-    fun observarDispositivos(
-        familiaId: String,
-        aoAtualizar: (List<Dispositivo>) -> Unit
-    ): ListenerRegistration {
-        return db.collection("familias").document(familiaId).collection("dispositivos")
-            .addSnapshotListener { snap, _ ->
-                val lista = snap?.documents?.map { d ->
-                    Dispositivo(
-                        id = d.id,
-                        nome = d.getString("nome") ?: "",
-                        online = d.getBoolean("online") ?: false,
-                        ultimaSincronizacao = d.getLong("ultimaSincronizacao") ?: 0L
-                    )
-                } ?: emptyList()
-                aoAtualizar(lista)
-            }
-    }
-
-    suspend fun atualizarEstadoDispositivo(familiaId: String, dispositivoId: String, online: Boolean) {
-        dispositivoRef(familiaId, dispositivoId).update(
-            mapOf(
-                "online" to online,
-                "ultimaSincronizacao" to System.currentTimeMillis()
-            )
-        ).await()
-    }
-
-    // ---------- Apps instaladas ----------
-
-    fun observarApps(
-        familiaId: String,
-        dispositivoId: String,
-        aoAtualizar: (List<AppInstalada>) -> Unit
-    ): ListenerRegistration {
-        return dispositivoRef(familiaId, dispositivoId).collection("apps")
-            .addSnapshotListener { snap, _ ->
-                val lista = snap?.documents?.map { it.toAppInstalada() } ?: emptyList()
-                aoAtualizar(lista)
-            }
-    }
-
-    suspend fun sincronizarAppsInstaladas(familiaId: String, dispositivoId: String, apps: List<AppInstalada>) {
-        val colecao = dispositivoRef(familiaId, dispositivoId).collection("apps")
-        val lote = db.batch()
-        apps.forEach { app ->
-            lote.set(
-                colecao.document(app.nomePacote),
-                mapOf(
-                    "nome" to app.nome,
-                    "pacote" to app.nomePacote,
-                    "icone" to app.iconeBase64,
-                    "instaladoEm" to app.instaladoEm,
-                    "regra" to app.regra.name
-                ),
-                com.google.firebase.firestore.SetOptions.merge()
-            )
-        }
-        lote.commit().await()
-    }
-
-    suspend fun definirRegraApp(familiaId: String, dispositivoId: String, nomePacote: String, regra: RegraApp, perfilHorarioId: String?) {
-        dispositivoRef(familiaId, dispositivoId).collection("apps").document(nomePacote)
-            .update(
-                mapOf(
-                    "regra" to regra.name,
-                    "perfilHorarioId" to perfilHorarioId
-                )
-            ).await()
-    }
-
-    // ---------- Regras de URL ----------
-
-    fun observarRegrasUrl(
-        familiaId: String,
-        dispositivoId: String,
-        aoAtualizar: (List<RegraUrl>) -> Unit
-    ): ListenerRegistration {
-        return dispositivoRef(familiaId, dispositivoId).collection("regrasUrl")
-            .addSnapshotListener { snap, _ ->
-                val lista = snap?.documents?.map { d ->
-                    RegraUrl(
-                        id = d.id,
-                        dominio = d.getString("dominio") ?: "",
-                        ativo = d.getBoolean("ativo") ?: false,
-                        perfilHorarioId = d.getString("perfilHorarioId")
-                    )
-                } ?: emptyList()
-                aoAtualizar(lista)
-            }
-    }
-
-    suspend fun adicionarRegraUrl(familiaId: String, dispositivoId: String, dominio: String): String {
-        val ref = dispositivoRef(familiaId, dispositivoId).collection("regrasUrl").document()
-        ref.set(mapOf("dominio" to dominio, "ativo" to true, "perfilHorarioId" to null)).await()
         return ref.id
     }
 
-    suspend fun alternarRegraUrl(familiaId: String, dispositivoId: String, regraId: String, ativo: Boolean) {
-        dispositivoRef(familiaId, dispositivoId).collection("regrasUrl").document(regraId)
-            .update("ativo", ativo).await()
+    suspend fun gerarConvite(fid: String, did: String): Pair<String, Long> {
+        val expiraEm = System.currentTimeMillis() + 10 * 60_000L
+        repeat(8) {
+            val codigo = (100000..999999).random().toString()
+            val ref = db.collection("convites").document(codigo)
+            val existente = ref.get().await()
+            val livre = !existente.exists() || (existente.getLong("expiraEm") ?: 0L) < System.currentTimeMillis()
+            if (livre) {
+                ref.set(mapOf("familiaId" to fid, "dispositivoId" to did, "expiraEm" to expiraEm)).await()
+                return codigo to expiraEm
+            }
+        }
+        throw IllegalStateException("Não foi possível gerar um código. Tente novamente.")
+    }
+
+    suspend fun lerConvite(codigo: String): Convite? {
+        val d = db.collection("convites").document(codigo).get().await()
+        if (!d.exists()) return null
+        val c = Convite(
+            codigo = codigo,
+            familiaId = d.getString("familiaId") ?: return null,
+            dispositivoId = d.getString("dispositivoId") ?: return null,
+            expiraEm = d.getLong("expiraEm") ?: 0L
+        )
+        return if (c.expiraEm < System.currentTimeMillis()) null else c
+    }
+
+    /** Executado no telemóvel da criança após validar o código. */
+    suspend fun concluirEmparelhamento(convite: Convite, uidCrianca: String, modeloAparelho: String) {
+        val fid = convite.familiaId
+        val did = convite.dispositivoId
+        familiaRef(fid).collection("membros").document(uidCrianca)
+            .set(mapOf("papel" to "filho", "codigo" to convite.codigo, "dispositivoId" to did)).await()
+        dispositivoRef(fid, did).update(
+            mapOf(
+                "nome" to modeloAparelho,
+                "emparelhado" to true,
+                "uidAutenticacao" to uidCrianca,
+                "onlineDeclarado" to true,
+                "ultimoSinal" to FieldValue.serverTimestamp()
+            )
+        ).await()
+        db.collection("convites").document(convite.codigo).delete()
+    }
+
+    suspend fun cancelarConvite(codigo: String) {
+        db.collection("convites").document(codigo).delete().await()
+    }
+
+    // ---------- Dispositivos ----------
+
+    fun observarDispositivos(fid: String): Flow<List<Dispositivo>> =
+        familiaRef(fid).collection("dispositivos").fluxo { s -> s.documents.map { it.paraDispositivo() } }
+
+    /**
+     * Emite null apenas quando o servidor confirma que o dispositivo foi apagado
+     * (um "não existe" vindo só da cache offline é ignorado).
+     */
+    fun observarDispositivo(fid: String, did: String): Flow<Dispositivo?> = callbackFlow {
+        val registo = dispositivoRef(fid, did).addSnapshotListener { snap, _ ->
+            if (snap != null) {
+                if (snap.exists()) trySend(snap.paraDispositivo())
+                else if (!snap.metadata.isFromCache) trySend(null)
+            }
+        }
+        awaitClose { registo.remove() }
+    }
+
+    suspend fun atualizarPerfilCrianca(fid: String, did: String, perfil: PerfilCrianca) {
+        dispositivoRef(fid, did).update("crianca", mapaDePerfil(perfil)).await()
+    }
+
+    suspend fun enviarHeartbeat(
+        fid: String, did: String, bateria: Int, aCarregar: Boolean, rede: String, protecao: EstadoProtecao
+    ) {
+        dispositivoRef(fid, did).update(
+            mapOf(
+                "ultimoSinal" to FieldValue.serverTimestamp(),
+                "onlineDeclarado" to true,
+                "bateria" to bateria,
+                "aCarregar" to aCarregar,
+                "rede" to rede,
+                "protecao" to mapOf(
+                    "vpnAtiva" to protecao.vpnAtiva,
+                    "acessibilidadeAtiva" to protecao.acessibilidadeAtiva,
+                    "adminAtivo" to protecao.adminAtivo,
+                    "localizacaoPermitida" to protecao.localizacaoPermitida,
+                    "localizacaoSempre" to protecao.localizacaoSempre,
+                    "usoAppsPermitido" to protecao.usoAppsPermitido,
+                    "notificacoesPermitidas" to protecao.notificacoesPermitidas
+                )
+            )
+        ).await()
+    }
+
+    /** Melhor esforço: chamado quando o telemóvel está a desligar. */
+    suspend fun marcarOffline(fid: String, did: String) {
+        dispositivoRef(fid, did).update(
+            mapOf("onlineDeclarado" to false, "ultimoSinal" to FieldValue.serverTimestamp())
+        ).await()
+    }
+
+    suspend fun removerDispositivo(fid: String, did: String) {
+        val ref = dispositivoRef(fid, did)
+        val uid = ref.get().await().getString("uidAutenticacao")
+        for (sub in listOf("apps", "regrasUrl", "perfisHorario", "relatorios", "bloqueios", "localizacoes")) {
+            apagarColecao(ref.collection(sub))
+        }
+        ref.delete().await()
+        if (!uid.isNullOrBlank()) {
+            familiaRef(fid).collection("membros").document(uid).delete().await()
+        }
+        for (nome in listOf("pedidos", "alertas")) {
+            val docs = familiaRef(fid).collection(nome).whereEqualTo("dispositivoId", did).get().await()
+            docs.documents.chunked(400).forEach { grupo ->
+                val lote = db.batch()
+                grupo.forEach { lote.delete(it.reference) }
+                lote.commit().await()
+            }
+        }
+    }
+
+    private suspend fun apagarColecao(col: CollectionReference) {
+        while (true) {
+            val docs = col.limit(400).get().await()
+            if (docs.isEmpty) break
+            val lote = db.batch()
+            docs.documents.forEach { lote.delete(it.reference) }
+            lote.commit().await()
+        }
+    }
+
+    // ---------- Localização ----------
+
+    suspend fun atualizarLocalizacao(fid: String, did: String, p: LocalizacaoPonto) {
+        dispositivoRef(fid, did).update(
+            "localizacaoAtual",
+            mapOf(
+                "latitude" to p.latitude,
+                "longitude" to p.longitude,
+                "precisaoMetros" to p.precisaoMetros.toDouble(),
+                "velocidadeMs" to p.velocidadeMs.toDouble(),
+                "timestamp" to p.timestamp
+            )
+        ).await()
+    }
+
+    suspend fun registarHistoricoLocalizacao(fid: String, did: String, p: LocalizacaoPonto) {
+        dispositivoRef(fid, did).collection("localizacoes").add(
+            mapOf(
+                "latitude" to p.latitude,
+                "longitude" to p.longitude,
+                "precisaoMetros" to p.precisaoMetros.toDouble(),
+                "timestamp" to p.timestamp
+            )
+        ).await()
+    }
+
+    fun observarHistoricoLocalizacao(fid: String, did: String, limite: Long = 60): Flow<List<LocalizacaoPonto>> =
+        dispositivoRef(fid, did).collection("localizacoes")
+            .orderBy("timestamp", Query.Direction.DESCENDING).limit(limite)
+            .fluxo { s ->
+                s.documents.map {
+                    LocalizacaoPonto(
+                        latitude = it.getDouble("latitude") ?: 0.0,
+                        longitude = it.getDouble("longitude") ?: 0.0,
+                        precisaoMetros = (it.getDouble("precisaoMetros") ?: 0.0).toFloat(),
+                        timestamp = it.getLong("timestamp") ?: 0L
+                    )
+                }
+            }
+
+    /** Pede ao telemóvel da criança para enviar a localização com mais frequência até [ateMs]. */
+    suspend fun definirRastreioAoVivo(fid: String, did: String, ateMs: Long) {
+        dispositivoRef(fid, did).update("rastreioAoVivoAte", ateMs).await()
+    }
+
+    // ---------- Apps ----------
+
+    fun observarApps(fid: String, did: String): Flow<List<AppInstalada>> =
+        dispositivoRef(fid, did).collection("apps").fluxo { s -> s.documents.map { it.paraApp() } }
+
+    /**
+     * Sincroniza a lista de apps instaladas sem tocar nas regras definidas pelos pais.
+     * Remove os documentos de apps que já não existem no telemóvel.
+     */
+    suspend fun sincronizarApps(fid: String, did: String, instaladas: List<AppInstalada>) {
+        val col = dispositivoRef(fid, did).collection("apps")
+        val existentes = col.get().await().documents.associateBy { it.id }
+        val novas = instaladas.associateBy { it.nomePacote }
+        val operacoes = mutableListOf<(com.google.firebase.firestore.WriteBatch) -> Unit>()
+
+        novas.forEach { (pacote, app) ->
+            val atual = existentes[pacote]
+            val precisaEscrever = atual == null ||
+                atual.getString("nome") != app.nome ||
+                (atual.getString("icone").isNullOrBlank() && !app.iconeBase64.isNullOrBlank())
+            if (precisaEscrever) {
+                val dados = mutableMapOf<String, Any?>(
+                    "pacote" to pacote,
+                    "nome" to app.nome,
+                    "instaladoEm" to app.instaladoEm
+                )
+                if (!app.iconeBase64.isNullOrBlank()) dados["icone"] = app.iconeBase64
+                if (atual == null) dados["regra"] = RegraApp.PERMITIDO.name
+                operacoes.add { it.set(col.document(pacote), dados, SetOptions.merge()) }
+            }
+        }
+        existentes.keys.filter { it !in novas }.forEach { pacote ->
+            operacoes.add { it.delete(col.document(pacote)) }
+        }
+        operacoes.chunked(400).forEach { grupo ->
+            val lote = db.batch()
+            grupo.forEach { it(lote) }
+            lote.commit().await()
+        }
+    }
+
+    suspend fun definirRegraApp(fid: String, did: String, pacote: String, regra: RegraApp, perfilHorarioId: String?) {
+        dispositivoRef(fid, did).collection("apps").document(pacote).set(
+            mapOf(
+                "pacote" to pacote,
+                "regra" to regra.name,
+                "perfilHorarioId" to if (regra == RegraApp.BLOQUEADO_POR_HORARIO) perfilHorarioId else null
+            ),
+            SetOptions.merge()
+        ).await()
+    }
+
+    // ---------- Regras de sites / redes sociais ----------
+
+    fun observarRegrasUrl(fid: String, did: String): Flow<List<RegraUrl>> =
+        dispositivoRef(fid, did).collection("regrasUrl").fluxo { s -> s.documents.map { it.paraRegraUrl() } }
+
+    /** Cria (id vazio) ou atualiza uma regra. Devolve o id. */
+    suspend fun guardarRegraUrl(fid: String, did: String, regra: RegraUrl): String {
+        val col = dispositivoRef(fid, did).collection("regrasUrl")
+        val ref = if (regra.id.isBlank()) col.document() else col.document(regra.id)
+        ref.set(
+            mapOf(
+                "rotulo" to regra.rotulo,
+                "tipo" to regra.tipo.name,
+                "dominios" to regra.dominios,
+                "pacotes" to regra.pacotes,
+                "ativo" to regra.ativo,
+                "perfilHorarioId" to regra.perfilHorarioId
+            )
+        ).await()
+        return ref.id
+    }
+
+    suspend fun removerRegraUrl(fid: String, did: String, regraId: String) {
+        dispositivoRef(fid, did).collection("regrasUrl").document(regraId).delete().await()
     }
 
     // ---------- Perfis de horário ----------
 
-    suspend fun criarPerfilHorario(familiaId: String, dispositivoId: String, perfil: PerfilHorario): String {
-        val ref = dispositivoRef(familiaId, dispositivoId).collection("perfisHorario").document()
-        val janelas = perfil.janelasPorDia.entries.associate { (dia, janelas) ->
-            dia.name to janelas.map { mapOf("inicio" to it.inicio, "fim" to it.fim) }
-        }
+    fun observarPerfisHorario(fid: String, did: String): Flow<List<PerfilHorario>> =
+        dispositivoRef(fid, did).collection("perfisHorario").fluxo { s -> s.documents.map { it.paraPerfil() } }
+
+    suspend fun guardarPerfilHorario(fid: String, did: String, perfil: PerfilHorario): String {
+        val col = dispositivoRef(fid, did).collection("perfisHorario")
+        val ref = if (perfil.id.isBlank()) col.document() else col.document(perfil.id)
+        val janelas = perfil.janelasPorDia.entries
+            .filter { it.value.isNotEmpty() }
+            .associate { (dia, lista) -> dia.name to lista.map { mapOf("inicio" to it.inicio, "fim" to it.fim) } }
         ref.set(mapOf("nome" to perfil.nome, "janelasPorDia" to janelas)).await()
         return ref.id
     }
 
-    fun observarPerfisHorario(
-        familiaId: String,
-        dispositivoId: String,
-        aoAtualizar: (List<PerfilHorario>) -> Unit
-    ): ListenerRegistration {
-        return dispositivoRef(familiaId, dispositivoId).collection("perfisHorario")
-            .addSnapshotListener { snap, _ ->
-                val lista = snap?.documents?.map { it.toPerfilHorario() } ?: emptyList()
-                aoAtualizar(lista)
-            }
+    /** Apaga o perfil e limpa as referências em apps e regras de sites. */
+    suspend fun removerPerfilHorario(fid: String, did: String, perfilId: String) {
+        val disp = dispositivoRef(fid, did)
+        val lote = db.batch()
+        disp.collection("apps").whereEqualTo("perfilHorarioId", perfilId).get().await().documents.forEach {
+            lote.update(it.reference, mapOf("perfilHorarioId" to null, "regra" to RegraApp.PERMITIDO.name))
+        }
+        disp.collection("regrasUrl").whereEqualTo("perfilHorarioId", perfilId).get().await().documents.forEach {
+            lote.update(it.reference, "perfilHorarioId", null)
+        }
+        lote.delete(disp.collection("perfisHorario").document(perfilId))
+        lote.commit().await()
     }
 
     // ---------- Pedidos de liberação ----------
 
-    suspend fun criarPedidoLiberacao(familiaId: String, dispositivoId: String, alvo: String, duracaoMinutos: Int = 15): String {
-        val ref = dispositivoRef(familiaId, dispositivoId).collection("pedidosLiberacao").document()
+    suspend fun criarPedido(fid: String, pedido: PedidoLiberacao): String {
+        val ref = familiaRef(fid).collection("pedidos").document()
         ref.set(
             mapOf(
-                "alvo" to alvo,
+                "dispositivoId" to pedido.dispositivoId,
+                "criancaNome" to pedido.criancaNome,
+                "alvo" to pedido.alvo,
+                "rotulo" to pedido.rotulo,
+                "tipoAlvo" to pedido.tipoAlvo.name,
                 "status" to StatusPedidoLiberacao.PENDENTE.name,
                 "criadoEm" to System.currentTimeMillis(),
-                "duracaoMinutos" to duracaoMinutos
+                "duracaoMinutos" to pedido.duracaoMinutos,
+                "decididoEm" to 0L,
+                "duracaoAprovadaMinutos" to 0
             )
         ).await()
         return ref.id
     }
 
-    fun observarPedidosLiberacao(
-        familiaId: String,
-        dispositivoId: String,
-        aoAtualizar: (List<PedidoLiberacao>) -> Unit
-    ): ListenerRegistration {
-        return dispositivoRef(familiaId, dispositivoId).collection("pedidosLiberacao")
-            .whereEqualTo("status", StatusPedidoLiberacao.PENDENTE.name)
-            .addSnapshotListener { snap, _ ->
-                val lista = snap?.documents?.map { d ->
-                    PedidoLiberacao(
-                        id = d.id,
-                        alvo = d.getString("alvo") ?: "",
-                        status = StatusPedidoLiberacao.valueOf(d.getString("status") ?: "PENDENTE"),
-                        criadoEm = d.getLong("criadoEm") ?: 0L,
-                        duracaoMinutos = (d.getLong("duracaoMinutos") ?: 15L).toInt()
+    fun observarPedidos(fid: String, limite: Long = 60): Flow<List<PedidoLiberacao>> =
+        familiaRef(fid).collection("pedidos")
+            .orderBy("criadoEm", Query.Direction.DESCENDING).limit(limite)
+            .fluxo { s -> s.documents.map { it.paraPedido() } }
+
+    fun observarPedidosDoDispositivo(fid: String, did: String): Flow<List<PedidoLiberacao>> =
+        familiaRef(fid).collection("pedidos").whereEqualTo("dispositivoId", did)
+            .fluxo { s -> s.documents.map { it.paraPedido() }.sortedByDescending { it.criadoEm }.take(30) }
+
+    suspend fun responderPedido(fid: String, pedidoId: String, aprovado: Boolean, minutos: Int) {
+        familiaRef(fid).collection("pedidos").document(pedidoId).update(
+            mapOf(
+                "status" to if (aprovado) StatusPedidoLiberacao.APROVADO.name else StatusPedidoLiberacao.RECUSADO.name,
+                "decididoEm" to System.currentTimeMillis(),
+                "duracaoAprovadaMinutos" to if (aprovado) minutos else 0
+            )
+        ).await()
+    }
+
+    // ---------- Alertas ----------
+
+    suspend fun enviarAlerta(fid: String, alerta: Alerta) {
+        familiaRef(fid).collection("alertas").add(
+            mapOf(
+                "dispositivoId" to alerta.dispositivoId,
+                "criancaNome" to alerta.criancaNome,
+                "tipo" to alerta.tipo.name,
+                "mensagem" to alerta.mensagem,
+                "criadoEm" to System.currentTimeMillis(),
+                "lido" to false
+            )
+        ).await()
+    }
+
+    fun observarAlertas(fid: String, limite: Long = 80): Flow<List<Alerta>> =
+        familiaRef(fid).collection("alertas")
+            .orderBy("criadoEm", Query.Direction.DESCENDING).limit(limite)
+            .fluxo { s -> s.documents.map { it.paraAlerta() } }
+
+    suspend fun marcarAlertaLido(fid: String, alertaId: String) {
+        familiaRef(fid).collection("alertas").document(alertaId).update("lido", true).await()
+    }
+
+    suspend fun marcarTodosAlertasLidos(fid: String, ids: List<String>) {
+        ids.chunked(400).forEach { grupo ->
+            val lote = db.batch()
+            grupo.forEach { lote.update(familiaRef(fid).collection("alertas").document(it), "lido", true) }
+            lote.commit().await()
+        }
+    }
+
+    // ---------- Relatórios e histórico de bloqueios ----------
+
+    /** Grava o total do dia (valores absolutos calculados no telemóvel; idempotente). */
+    suspend fun guardarTempoEcraDia(fid: String, did: String, data: String, porApp: Map<String, Long>) {
+        val codificado = porApp.entries.associate { it.key.replace(".", "%2E") to it.value }
+        dispositivoRef(fid, did).collection("relatorios").document(data).set(
+            mapOf(
+                "data" to data,
+                "tempoEcraPorApp" to codificado,
+                "totalMs" to porApp.values.sum(),
+                "atualizadoEm" to System.currentTimeMillis()
+            )
+        ).await()
+    }
+
+    fun observarRelatorios(fid: String, did: String, dias: Long = 7): Flow<List<RelatorioDiario>> =
+        dispositivoRef(fid, did).collection("relatorios")
+            .orderBy(FieldPath.documentId(), Query.Direction.DESCENDING).limit(dias)
+            .fluxo { s ->
+                s.documents.map { d ->
+                    val bruto = d.get("tempoEcraPorApp") as? Map<*, *> ?: emptyMap<String, Any>()
+                    val mapa = bruto.entries.associate { (k, v) ->
+                        k.toString().replace("%2E", ".") to ((v as? Number)?.toLong() ?: 0L)
+                    }
+                    RelatorioDiario(
+                        data = d.id,
+                        tempoEcraPorApp = mapa,
+                        totalMs = d.getLong("totalMs") ?: mapa.values.sum()
                     )
-                } ?: emptyList()
-                aoAtualizar(lista)
+                }
             }
+
+    suspend fun registarBloqueio(fid: String, did: String, r: RegistoBloqueio) {
+        dispositivoRef(fid, did).collection("bloqueios").add(
+            mapOf(
+                "tipo" to r.tipo.name,
+                "alvo" to r.alvo,
+                "rotulo" to r.rotulo,
+                "em" to System.currentTimeMillis()
+            )
+        ).await()
     }
 
-    suspend fun responderPedidoLiberacao(familiaId: String, dispositivoId: String, pedidoId: String, aprovado: Boolean) {
-        dispositivoRef(familiaId, dispositivoId).collection("pedidosLiberacao").document(pedidoId)
-            .update("status", if (aprovado) StatusPedidoLiberacao.APROVADO.name else StatusPedidoLiberacao.RECUSADO.name)
-            .await()
-    }
-
-    // ---------- Relatórios ----------
-
-    suspend fun registarTempoEcra(familiaId: String, dispositivoId: String, data: String, pacote: String, incrementoMs: Long) {
-        val ref = dispositivoRef(familiaId, dispositivoId).collection("relatorios").document(data)
-        db.runTransaction { transacao ->
-            val atual = transacao.get(ref)
-            @Suppress("UNCHECKED_CAST")
-            val tempos = (atual.get("tempoEcraPorApp") as? Map<String, Long>)?.toMutableMap() ?: mutableMapOf()
-            tempos[pacote] = (tempos[pacote] ?: 0L) + incrementoMs
-            transacao.set(ref, mapOf("tempoEcraPorApp" to tempos), com.google.firebase.firestore.SetOptions.merge())
-        }.await()
-    }
-
-    suspend fun registarBloqueioTentado(familiaId: String, dispositivoId: String, data: String, alvo: String) {
-        val ref = dispositivoRef(familiaId, dispositivoId).collection("relatorios").document(data)
-        ref.update("bloqueiosTentados", com.google.firebase.firestore.FieldValue.arrayUnion(alvo))
-            .addOnFailureListener {
-                // Documento ainda não existe nesse dia; cria-o.
-                ref.set(mapOf("bloqueiosTentados" to listOf(alvo)), com.google.firebase.firestore.SetOptions.merge())
+    fun observarBloqueios(fid: String, did: String, limite: Long = 100): Flow<List<RegistoBloqueio>> =
+        dispositivoRef(fid, did).collection("bloqueios")
+            .orderBy("em", Query.Direction.DESCENDING).limit(limite)
+            .fluxo { s ->
+                s.documents.map {
+                    RegistoBloqueio(
+                        id = it.id,
+                        tipo = enumDe(it.getString("tipo"), TipoAlvo.APP),
+                        alvo = it.getString("alvo") ?: "",
+                        rotulo = it.getString("rotulo") ?: "",
+                        em = it.getLong("em") ?: 0L
+                    )
+                }
             }
-    }
 
-    private fun com.google.firebase.firestore.DocumentSnapshot.toAppInstalada(): AppInstalada {
-        return AppInstalada(
-            nomePacote = getString("pacote") ?: id,
+    // ---------- Conversões ----------
+
+    private fun mapaDePerfil(p: PerfilCrianca): Map<String, Any?> = mapOf(
+        "nome" to p.nome,
+        "telefone" to p.telefone,
+        "email" to p.email,
+        "fotoBase64" to p.fotoBase64
+    )
+
+    private inline fun <reified E : Enum<E>> enumDe(valor: String?, padrao: E): E =
+        try { if (valor == null) padrao else enumValueOf<E>(valor) } catch (e: Exception) { padrao }
+
+    private fun DocumentSnapshot.paraDispositivo(): Dispositivo {
+        val ultimo = getTimestamp("ultimoSinal", DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            ?.toDate()?.time ?: 0L
+        val loc = if (get("localizacaoAtual") != null) {
+            LocalizacaoPonto(
+                latitude = getDouble("localizacaoAtual.latitude") ?: 0.0,
+                longitude = getDouble("localizacaoAtual.longitude") ?: 0.0,
+                precisaoMetros = (getDouble("localizacaoAtual.precisaoMetros") ?: 0.0).toFloat(),
+                velocidadeMs = (getDouble("localizacaoAtual.velocidadeMs") ?: 0.0).toFloat(),
+                timestamp = getLong("localizacaoAtual.timestamp") ?: 0L
+            )
+        } else null
+        return Dispositivo(
+            id = id,
             nome = getString("nome") ?: "",
-            iconeBase64 = getString("icone"),
-            instaladoEm = getLong("instaladoEm") ?: 0L,
-            regra = RegraApp.valueOf(getString("regra") ?: RegraApp.PERMITIDO.name),
+            crianca = PerfilCrianca(
+                nome = getString("crianca.nome") ?: "",
+                telefone = getString("crianca.telefone") ?: "",
+                email = getString("crianca.email") ?: "",
+                fotoBase64 = getString("crianca.fotoBase64")
+            ),
+            emparelhado = getBoolean("emparelhado") ?: false,
+            onlineDeclarado = getBoolean("onlineDeclarado") ?: false,
+            ultimoSinal = ultimo,
+            bateria = (getLong("bateria") ?: -1L).toInt(),
+            aCarregar = getBoolean("aCarregar") ?: false,
+            rede = getString("rede") ?: "",
+            localizacaoAtual = loc,
+            rastreioAoVivoAte = getLong("rastreioAoVivoAte") ?: 0L,
+            protecao = EstadoProtecao(
+                vpnAtiva = getBoolean("protecao.vpnAtiva") ?: false,
+                acessibilidadeAtiva = getBoolean("protecao.acessibilidadeAtiva") ?: false,
+                adminAtivo = getBoolean("protecao.adminAtivo") ?: false,
+                localizacaoPermitida = getBoolean("protecao.localizacaoPermitida") ?: false,
+                localizacaoSempre = getBoolean("protecao.localizacaoSempre") ?: false,
+                usoAppsPermitido = getBoolean("protecao.usoAppsPermitido") ?: false,
+                notificacoesPermitidas = getBoolean("protecao.notificacoesPermitidas") ?: false
+            ),
+            uidAutenticacao = getString("uidAutenticacao") ?: ""
+        )
+    }
+
+    private fun DocumentSnapshot.paraApp(): AppInstalada = AppInstalada(
+        nomePacote = getString("pacote") ?: id,
+        nome = getString("nome") ?: "",
+        iconeBase64 = getString("icone"),
+        instaladoEm = getLong("instaladoEm") ?: 0L,
+        regra = enumDe(getString("regra"), RegraApp.PERMITIDO),
+        perfilHorarioId = getString("perfilHorarioId")
+    )
+
+    private fun DocumentSnapshot.paraRegraUrl(): RegraUrl {
+        fun lista(campo: String): List<String> =
+            (get(campo) as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
+        return RegraUrl(
+            id = id,
+            rotulo = getString("rotulo") ?: "",
+            tipo = enumDe(getString("tipo"), TipoRegraUrl.PERSONALIZADO),
+            dominios = lista("dominios"),
+            pacotes = lista("pacotes"),
+            ativo = getBoolean("ativo") ?: false,
             perfilHorarioId = getString("perfilHorarioId")
         )
     }
 
-    private fun com.google.firebase.firestore.DocumentSnapshot.toPerfilHorario(): PerfilHorario {
-        @Suppress("UNCHECKED_CAST")
-        val janelasRaw = get("janelasPorDia") as? Map<String, List<Map<String, String>>> ?: emptyMap()
-        val janelas = janelasRaw.entries.associate { (dia, lista) ->
-            DiaSemana.valueOf(dia) to lista.map { JanelaHorario(it["inicio"] ?: "00:00", it["fim"] ?: "23:59") }
+    private fun DocumentSnapshot.paraPerfil(): PerfilHorario {
+        val bruto = get("janelasPorDia") as? Map<*, *> ?: emptyMap<String, Any>()
+        val janelas = mutableMapOf<DiaSemana, List<JanelaHorario>>()
+        bruto.forEach { (chave, valor) ->
+            val dia = try { DiaSemana.valueOf(chave.toString()) } catch (e: Exception) { null }
+            if (dia != null) {
+                janelas[dia] = (valor as? List<*>)?.mapNotNull { item ->
+                    val m = item as? Map<*, *> ?: return@mapNotNull null
+                    JanelaHorario(m["inicio"]?.toString() ?: "00:00", m["fim"]?.toString() ?: "24:00")
+                } ?: emptyList()
+            }
         }
         return PerfilHorario(id = id, nome = getString("nome") ?: "", janelasPorDia = janelas)
     }
+
+    private fun DocumentSnapshot.paraPedido(): PedidoLiberacao = PedidoLiberacao(
+        id = id,
+        dispositivoId = getString("dispositivoId") ?: "",
+        criancaNome = getString("criancaNome") ?: "",
+        alvo = getString("alvo") ?: "",
+        rotulo = getString("rotulo") ?: "",
+        tipoAlvo = enumDe(getString("tipoAlvo"), TipoAlvo.APP),
+        status = enumDe(getString("status"), StatusPedidoLiberacao.PENDENTE),
+        criadoEm = getLong("criadoEm") ?: 0L,
+        duracaoMinutos = (getLong("duracaoMinutos") ?: 15L).toInt(),
+        decididoEm = getLong("decididoEm") ?: 0L,
+        duracaoAprovadaMinutos = (getLong("duracaoAprovadaMinutos") ?: 0L).toInt()
+    )
+
+    private fun DocumentSnapshot.paraAlerta(): Alerta = Alerta(
+        id = id,
+        dispositivoId = getString("dispositivoId") ?: "",
+        criancaNome = getString("criancaNome") ?: "",
+        tipo = enumDe(getString("tipo"), TipoAlerta.INFO),
+        mensagem = getString("mensagem") ?: "",
+        criadoEm = getLong("criadoEm") ?: 0L,
+        lido = getBoolean("lido") ?: false
+    )
 }
